@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MountainCar Game</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f0f2f5;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+        }
+        #game-container {
+            background-color: #ffffff;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        canvas {
+            background-color: #e8f0fe;
+            border: 2px solid #1a73e8;
+            border-radius: 8px;
+            display: block;
+            margin: 0 auto;
+        }
+        .info {
+            margin-top: 15px;
+            font-size: 18px;
+            color: #333;
+        }
+        .controls {
+            margin-top: 10px;
+            font-size: 14px;
+            color: #666;
+            line-height: 1.5;
+        }
+        button {
+            margin-top: 15px;
+            padding: 10px 20px;
+            font-size: 16px;
+            background-color: #1a73e8;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: #1557b0;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <h2>MountainCar</h2>
+    <canvas id="gameCanvas" width="600" height="400"></canvas>
+    <div class="info">
+        経過ステップ数: <strong id="score">0</strong>
+    </div>
+    <div class="controls">
+        操作方法: <strong>[←] [→]</strong> キーで車を加速<br>
+        エンジンの力だけでは坂を登れません。左右に勢いをつけて右の旗を目指してください！
+    </div>
+    <button id="restartBtn" onclick="resetGame()" style="display: none;">もう一度遊ぶ (Spaceキー)</button>
+</div>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const scoreElement = document.getElementById('score');
+    const restartBtn = document.getElementById('restartBtn');
+
+    // --- MountainCar 物理演算の定数 (OpenAI Gymに準拠) ---
+    const min_position = -1.2;
+    const max_position = 0.6;
+    const max_speed = 0.07;
+    const goal_position = 0.5;
+    const force = 0.001;
+    const gravity = 0.0025;
+
+    // --- 状態変数 ---
+    let position = -0.5;
+    let velocity = 0.0;
+    let steps = 0;
+    let gameCleared = false;
+    let animationId;
+
+    // --- キーボード入力の管理 ---
+    let keys = {
+        ArrowLeft: false,
+        ArrowRight: false
+    };
+
+    window.addEventListener('keydown', (e) => {
+        if (e.code === 'ArrowLeft') keys.ArrowLeft = true;
+        if (e.code === 'ArrowRight') keys.ArrowRight = true;
+        if (e.code === 'Space' && gameCleared) resetGame();
+        // 矢印キーでの画面スクロールを防ぐ
+        if(["ArrowLeft","ArrowRight","Space"].indexOf(e.code) > -1) {
+            e.preventDefault();
+        }
+    });
+
+    window.addEventListener('keyup', (e) => {
+        if (e.code === 'ArrowLeft') keys.ArrowLeft = false;
+        if (e.code === 'ArrowRight') keys.ArrowRight = false;
+    });
+
+    // --- 座標変換関数 (物理座標 -> キャンバスピクセル) ---
+    function mapX(x) {
+        return ((x - min_position) / (max_position - min_position)) * canvas.width;
+    }
+
+    function mapY(y) {
+        // yの範囲はおおよそ [-1, 1]
+        return canvas.height * 0.65 - y * 120; 
+    }
+
+    // --- ゲームのリセット ---
+    function resetGame() {
+        // 位置は -0.6 ~ -0.4 の間でランダム、速度は0 (Gym準拠)
+        position = -0.6 + Math.random() * 0.2;
+        velocity = 0.0;
+        steps = 0;
+        gameCleared = false;
+        
+        restartBtn.style.display = 'none';
+        scoreElement.innerText = steps;
+        scoreElement.style.color = '#333';
+        
+        cancelAnimationFrame(animationId);
+        gameLoop();
+    }
+
+    // --- 物理演算のステップ ---
+    function step() {
+        if (gameCleared) return;
+
+        // 入力からアクションを決定 (0: 左, 1: なし, 2: 右)
+        let action = 1; 
+        if (keys.ArrowLeft) action = 0;
+        else if (keys.ArrowRight) action = 2;
+
+        // 速度の更新
+        velocity += (action - 1) * force - Math.cos(3 * position) * gravity;
+        
+        // 速度のクリッピング (制限)
+        velocity = Math.max(-max_speed, Math.min(max_speed, velocity));
+
+        // 位置の更新
+        position += velocity;
+
+        // 位置のクリッピングと左端での速度リセット
+        if (position < min_position) {
+            position = min_position;
+            velocity = 0;
+        }
+        if (position > max_position) {
+            position = max_position;
+        }
+
+        steps++;
+        scoreElement.innerText = steps;
+
+        // クリア判定
+        if (position >= goal_position) {
+            gameCleared = true;
+            restartBtn.style.display = 'inline-block';
+            scoreElement.style.color = '#0f9d58';
+        }
+    }
+
+    // --- 描画処理 ---
+    function draw() {
+        // キャンバスのクリア
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // 1. 地形 (山) の描画
+        ctx.beginPath();
+        for (let px = 0; px <= canvas.width; px++) {
+            let x = min_position + (px / canvas.width) * (max_position - min_position);
+            let y = Math.sin(3 * x);
+            let py = mapY(y);
+            
+            if (px === 0) ctx.moveTo(px, py);
+            else ctx.lineTo(px, py);
+        }
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#27ae60';
+        ctx.stroke();
+
+        // 地形の下を塗りつぶす
+        ctx.lineTo(canvas.width, canvas.height);
+        ctx.lineTo(0, canvas.height);
+        ctx.fillStyle = 'rgba(39, 174, 96, 0.2)';
+        ctx.fill();
+
+        // 2. ゴールの旗を描画
+        let flagX = mapX(goal_position);
+        let flagY = mapY(Math.sin(3 * goal_position));
+        
+        // ポール
+        ctx.beginPath();
+        ctx.moveTo(flagX, flagY);
+        ctx.lineTo(flagX, flagY - 60);
+        ctx.lineWidth = 3;
+        ctx.strokeStyle = '#7f8c8d';
+        ctx.stroke();
+        
+        // 旗
+        ctx.fillStyle = '#f1c40f';
+        ctx.fillRect(flagX, flagY - 60, 30, 20);
+
+        // 3. 車の描画
+        let carX = mapX(position);
+        let carY = mapY(Math.sin(3 * position));
+        
+        // 傾き (微小なxの変動からキャンバス上の角度を計算)
+        let dx = 0.01;
+        let p_next = position + dx;
+        let angle = Math.atan2(
+            mapY(Math.sin(3 * p_next)) - carY, 
+            mapX(p_next) - carX
+        );
+
+        ctx.save();
+        ctx.translate(carX, carY);
+        ctx.rotate(angle);
+
+        // 車体
+        ctx.fillStyle = '#e74c3c';
+        ctx.beginPath();
+        ctx.roundRect(-20, -15, 40, 15, 5); // 上半分の丸み
+        ctx.fill();
+
+        // 窓
+        ctx.fillStyle = '#ecf0f1';
+        ctx.fillRect(-10, -12, 20, 8);
+
+        // タイヤ
+        ctx.fillStyle = '#2c3e50';
+        ctx.beginPath();
+        ctx.arc(-12, 2, 6, 0, Math.PI * 2);
+        ctx.arc(12, 2, 6, 0, Math.PI * 2);
+        ctx.fill();
+        
+        ctx.restore();
+
+        // 4. クリア時のテキスト
+        if (gameCleared) {
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.8)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            ctx.fillStyle = '#0f9d58';
+            ctx.font = 'bold 48px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('GOAL!', canvas.width / 2, canvas.height / 2 - 20);
+            
+            ctx.fillStyle = '#333';
+            ctx.font = '24px sans-serif';
+            ctx.fillText(`記録: ${steps} ステップ`, canvas.width / 2, canvas.height / 2 + 30);
+        }
+    }
+
+    // --- メインループ ---
+    function gameLoop() {
+        step();
+        draw();
+        
+        if (!gameCleared) {
+            // Gym環境の標準に従い、60FPSを目指して更新
+            animationId = requestAnimationFrame(gameLoop);
+        }
+    }
+
+    // ゲーム開始
+    resetGame();
+</script>
+
+</body>
+</html>

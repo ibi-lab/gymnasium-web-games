@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CartPole Game</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f0f2f5;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+        }
+        #game-container {
+            background-color: #ffffff;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        canvas {
+            background-color: #e8f0fe;
+            border: 2px solid #1a73e8;
+            border-radius: 8px;
+            display: block;
+            margin: 0 auto;
+        }
+        .info {
+            margin-top: 15px;
+            font-size: 18px;
+            color: #333;
+        }
+        .controls {
+            margin-top: 10px;
+            font-size: 14px;
+            color: #666;
+        }
+        button {
+            margin-top: 15px;
+            padding: 10px 20px;
+            font-size: 16px;
+            background-color: #1a73e8;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: #1557b0;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <h2>CartPole (倒立振子)</h2>
+    <canvas id="gameCanvas" width="600" height="400"></canvas>
+    <div class="info">
+        スコア (生存フレーム数): <strong id="score">0</strong>
+    </div>
+    <div class="controls">
+        操作方法: <strong>[←] [→]</strong> キーでカートを移動<br>
+        ポールが倒れるか、画面端に到達するとゲームオーバーです。
+    </div>
+    <button id="restartBtn" onclick="resetGame()" style="display: none;">リトライ (Spaceキー)</button>
+</div>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const scoreElement = document.getElementById('score');
+    const restartBtn = document.getElementById('restartBtn');
+
+    // --- CartPole 物理演算の定数 (OpenAI Gymに準拠) ---
+    const gravity = 9.8;
+    const masscart = 1.0;
+    const masspole = 0.1;
+    const total_mass = (masscart + masspole);
+    const length = 0.5; // ポールの半分の長さ
+    const polemass_length = (masspole * length);
+    const force_mag = 10.0;
+    const tau = 0.02; // フレーム間の経過時間 (秒)
+    const theta_threshold_radians = 12 * 2 * Math.PI / 360; // 終了条件: ±12度
+    const x_threshold = 2.4; // 終了条件: 画面端
+
+    // --- 状態変数 ---
+    let state = [0, 0, 0, 0]; // [x, x_dot, theta, theta_dot]
+    let score = 0;
+    let gameOver = false;
+    let action = 0; // -1: 左, 0: なし, 1: 右
+    let animationId;
+
+    // --- キーボード入力の管理 ---
+    let keys = {
+        ArrowLeft: false,
+        ArrowRight: false
+    };
+
+    window.addEventListener('keydown', (e) => {
+        if (e.code === 'ArrowLeft') keys.ArrowLeft = true;
+        if (e.code === 'ArrowRight') keys.ArrowRight = true;
+        if (e.code === 'Space' && gameOver) resetGame();
+    });
+
+    window.addEventListener('keyup', (e) => {
+        if (e.code === 'ArrowLeft') keys.ArrowLeft = false;
+        if (e.code === 'ArrowRight') keys.ArrowRight = false;
+    });
+
+    // --- ゲームのリセット ---
+    function resetGame() {
+        // 初期状態を少しランダムにする (Gymに準拠)
+        state = [
+            (Math.random() - 0.5) * 0.1,
+            (Math.random() - 0.5) * 0.1,
+            (Math.random() - 0.5) * 0.1,
+            (Math.random() - 0.5) * 0.1
+        ];
+        score = 0;
+        gameOver = false;
+        restartBtn.style.display = 'none';
+        scoreElement.innerText = score;
+        scoreElement.style.color = '#333';
+        
+        cancelAnimationFrame(animationId);
+        gameLoop();
+    }
+
+    // --- 物理演算のステップ ---
+    function step() {
+        if (gameOver) return;
+
+        // 入力からアクションを決定
+        action = 0;
+        if (keys.ArrowLeft) action = -1;
+        if (keys.ArrowRight) action = 1;
+
+        let x = state[0];
+        let x_dot = state[1];
+        let theta = state[2];
+        let theta_dot = state[3];
+
+        let force = action * force_mag;
+        let costheta = Math.cos(theta);
+        let sintheta = Math.sin(theta);
+
+        // 運動方程式 (Euler法による積分)
+        let temp = (force + polemass_length * theta_dot * theta_dot * sintheta) / total_mass;
+        let thetaacc = (gravity * sintheta - costheta * temp) / (length * (4.0 / 3.0 - masspole * costheta * costheta / total_mass));
+        let xacc = temp - polemass_length * thetaacc * costheta / total_mass;
+
+        x = x + tau * x_dot;
+        x_dot = x_dot + tau * xacc;
+        theta = theta + tau * theta_dot;
+        theta_dot = theta_dot + tau * thetaacc;
+
+        state = [x, x_dot, theta, theta_dot];
+
+        // 終了判定
+        let done = x < -x_threshold || 
+                   x > x_threshold || 
+                   theta < -theta_threshold_radians || 
+                   theta > theta_threshold_radians;
+
+        if (done) {
+            gameOver = true;
+            restartBtn.style.display = 'inline-block';
+            scoreElement.style.color = '#d93025';
+        } else {
+            score++;
+            scoreElement.innerText = score;
+        }
+    }
+
+    // --- 描画処理 ---
+    function draw() {
+        // キャンバスのクリア
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        let x = state[0];
+        let theta = state[2];
+
+        // スケール変換 (物理座標 -> ピクセル座標)
+        // x軸: -2.4 ~ 2.4 を 0 ~ 600 にマッピング
+        let scale = canvas.width / (x_threshold * 2);
+        let cart_w = 50;
+        let cart_h = 30;
+        let cart_x = (x + x_threshold) * scale - cart_w / 2;
+        let cart_y = canvas.height / 2 + 50; // 少し下寄りに配置
+
+        let pole_w = 10;
+        let pole_l = length * scale * 2; // ポールの長さを画面スケールに合わせる
+
+        // 軌道の線を描画
+        ctx.beginPath();
+        ctx.moveTo(0, cart_y + cart_h / 2);
+        ctx.lineTo(canvas.width, cart_y + cart_h / 2);
+        ctx.strokeStyle = '#bdc3c7';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        // カートを描画
+        ctx.fillStyle = '#2c3e50';
+        ctx.fillRect(cart_x, cart_y - cart_h / 2, cart_w, cart_h);
+
+        // ジョイント部分
+        let joint_x = cart_x + cart_w / 2;
+        let joint_y = cart_y - cart_h / 2;
+
+        // ポールを描画 (回転を考慮)
+        ctx.save();
+        ctx.translate(joint_x, joint_y);
+        ctx.rotate(theta); // 時計回りが正なのでそのまま
+        ctx.fillStyle = '#e74c3c';
+        ctx.fillRect(-pole_w / 2, -pole_l, pole_w, pole_l);
+        ctx.restore();
+
+        // ジョイントのピン
+        ctx.beginPath();
+        ctx.arc(joint_x, joint_y, 5, 0, 2 * Math.PI);
+        ctx.fillStyle = '#f1c40f';
+        ctx.fill();
+
+        // ゲームオーバー時のテキスト
+        if (gameOver) {
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.7)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            
+            ctx.fillStyle = '#d93025';
+            ctx.font = 'bold 36px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('GAME OVER', canvas.width / 2, canvas.height / 2);
+        }
+    }
+
+    // --- メインループ ---
+    function gameLoop() {
+        step();
+        draw();
+        
+        if (!gameOver) {
+            // 約50FPSで実行 (1フレーム=20msに近似)
+            setTimeout(() => {
+                animationId = requestAnimationFrame(gameLoop);
+            }, 20); 
+        }
+    }
+
+    // ゲーム開始
+    resetGame();
+</script>
+
+</body>
+</html>

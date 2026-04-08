@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LunarLander (Box2D)</title>
+    <script src="https://cdn.jsdelivr.net/npm/planck@1/dist/planck.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f0f2f5;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+        }
+        #game-container {
+            background-color: #ffffff;
+            padding: 20px;
+            border-radius: 12px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.1);
+            text-align: center;
+        }
+        canvas {
+            background-color: #111; /* 宇宙空間を表現 */
+            border: 2px solid #34495e;
+            border-radius: 8px;
+            display: block;
+            margin: 0 auto;
+        }
+        .controls {
+            margin-top: 10px;
+            font-size: 14px;
+            color: #666;
+            line-height: 1.5;
+        }
+        button {
+            margin-top: 15px;
+            padding: 10px 20px;
+            font-size: 16px;
+            background-color: #9b59b6;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        button:hover {
+            background-color: #8e44ad;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <h2>LunarLander (Powered by Box2D)</h2>
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+    <div class="controls">
+        操作方法: <strong>[↑]</strong> メインエンジン / <strong>[←] [→]</strong> 姿勢制御スラスター<br>
+        2つの黄色い旗の間（着陸パッド）に、機体を水平にしてゆっくりと着陸させてください。
+    </div>
+    <button id="restartBtn" onclick="initGame()" style="display: none;">リトライ (Spaceキー)</button>
+</div>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const restartBtn = document.getElementById('restartBtn');
+
+    // Box2D (planck.js) のエイリアス
+    const pl = planck;
+
+    let world;
+    let lander;
+    let gameState = 'playing'; // 'playing', 'win', 'lose'
+    let fuel = 1000;
+    let particles = [];
+    let animationId;
+
+    // --- 地形データ (着陸パッドは X: -5 ~ 5 の間) ---
+    const terrainPoints = [
+        pl.Vec2(-20, 5),
+        pl.Vec2(-15, 2),
+        pl.Vec2(-10, -2),
+        pl.Vec2(-5, -5), // パッド左端
+        pl.Vec2(5, -5),  // パッド右端
+        pl.Vec2(10, -1),
+        pl.Vec2(15, 4),
+        pl.Vec2(20, 6)
+    ];
+
+    // --- キーボード入力の管理 ---
+    const keys = { ArrowUp: false, ArrowLeft: false, ArrowRight: false };
+    
+    window.addEventListener('keydown', (e) => {
+        if (keys.hasOwnProperty(e.code)) {
+            keys[e.code] = true;
+            e.preventDefault();
+        }
+        if (e.code === 'Space' && gameState !== 'playing') initGame();
+    });
+
+    window.addEventListener('keyup', (e) => {
+        if (keys.hasOwnProperty(e.code)) keys[e.code] = false;
+    });
+
+    // --- ゲームの初期化 (アップデート: ランダムな初期状態) ---
+    function initGame() {
+        if (animationId) cancelAnimationFrame(animationId);
+
+        // 重力設定 (-10)
+        world = pl.World(pl.Vec2(0, -10));
+        gameState = 'playing';
+        fuel = 1000;
+        particles = [];
+        restartBtn.style.display = 'none';
+
+        // ヘルパー関数: 指定範囲のランダムな値を取得
+        const getRandomRange = (min, max) => Math.random() * (max - min) + min;
+
+        // --- ランダムな初期状態の計算 ---
+        // 1. 位置: Xはパッド(-5 ~ 5)から離れた位置も含めてランダムに配置, Yは上部
+        const initialX = getRandomRange(-12, 12); // ±12メートルの範囲
+        const initialY = getRandomRange(18, 23); // 18~23メートルの高さ
+
+        // 2. 角度: 垂直(0)を中心に、左右に一定の範囲で傾ける。±45度(±0.78ラジアン)
+        const initialAngle = getRandomRange(-0.78, 0.78);
+
+        // 3. 速度: 小さなランダムな初期速度を与える。VX:[-3, 3], VY:[-1, 1]
+        const initialVX = getRandomRange(-3, 3);
+        const initialVY = getRandomRange(-1, 1);
+
+        // 4. 角速度: 小さなランダムな回転を与える。±0.5ラジアン/秒 (±28度/秒)
+        const initialAngularVel = getRandomRange(-0.5, 0.5);
+
+        // 1. 地形の生成 (Static Body)
+        const ground = world.createBody();
+        ground.createFixture(pl.Chain(terrainPoints), {
+            friction: 0.8,
+            restitution: 0.0
+        });
+
+        // 2. 着陸船の生成 (Dynamic Body)
+        lander = world.createDynamicBody({
+            position: pl.Vec2(initialX, initialY), // ★ランダム化
+            angle: initialAngle,                 // ★ランダム化
+            angularDamping: 1.5, // 姿勢制御しやすくするための空気抵抗（Gym準拠）
+            linearDamping: 0.1
+        });
+        lander.setSleepingAllowed(false);
+
+        // 初期速度と角速度を設定
+        lander.setLinearVelocity(pl.Vec2(initialVX, initialVY));
+        lander.setAngularVelocity(initialAngularVel);
+
+        // 機体メインパーツ (高密度)
+        lander.createFixture(pl.Polygon([
+            pl.Vec2(-1, -1), pl.Vec2(1, -1), pl.Vec2(1.5, 0),
+            pl.Vec2(1, 1), pl.Vec2(-1, 1), pl.Vec2(-1.5, 0)
+        ]), { density: 2.0, friction: 0.5, restitution: 0.0 });
+
+        // 左脚 (低密度、高摩擦)
+        lander.createFixture(pl.Polygon([
+            pl.Vec2(-1, -1), pl.Vec2(-2.2, -2.5), pl.Vec2(-1.8, -2.6)
+        ]), { density: 0.5, friction: 1.0, restitution: 0.0 });
+        
+        // 右脚 (低密度、高摩擦)
+        lander.createFixture(pl.Polygon([
+            pl.Vec2(1, -1), pl.Vec2(2.2, -2.5), pl.Vec2(1.8, -2.6)
+        ]), { density: 0.5, friction: 1.0, restitution: 0.0 });
+
+        gameLoop();
+    }
+
+    // --- パーティクル（炎）の生成 ---
+    function emitParticle(x, y, vx, vy, isMain) {
+        particles.push({
+            x: x, y: y, vx: vx, vy: vy,
+            life: 1.0,
+            color: isMain ? '230, 126, 34' : '241, 196, 15' // RGB形式
+        });
+    }
+
+    // --- 物理演算のステップ ---
+    function updatePhysics() {
+        if (gameState !== 'playing') return;
+
+        const mass = lander.getMass();
+
+        // メインエンジン (上方向へ推力)
+        if (keys.ArrowUp && fuel > 0) {
+            let force = lander.getWorldVector(pl.Vec2(0, mass * 25)); // 2.5Gの推力
+            let point = lander.getWorldPoint(pl.Vec2(0, -1.2));
+            lander.applyForce(force, point, true);
+            fuel -= 1.5;
+
+            for(let i=0; i<3; i++) {
+                emitParticle(
+                    point.x + (Math.random()-0.5)*0.5, point.y,
+                    (Math.random()-0.5)*2, -4 - Math.random()*4, true
+                );
+            }
+        }
+
+        // 左スラスター (機体を右回転 / 右へ移動)
+        if (keys.ArrowRight && fuel > 0) {
+            let force = lander.getWorldVector(pl.Vec2(mass * 8, 0));
+            let point = lander.getWorldPoint(pl.Vec2(-1.5, 1));
+            lander.applyForce(force, point, true);
+            fuel -= 0.5;
+
+            let p = lander.getWorldPoint(pl.Vec2(-1.5, 1));
+            emitParticle(p.x, p.y, -2 - Math.random()*2, (Math.random()-0.5), false);
+        }
+
+        // 右スラスター (機体を左回転 / 左へ移動)
+        if (keys.ArrowLeft && fuel > 0) {
+            let force = lander.getWorldVector(pl.Vec2(-mass * 8, 0));
+            let point = lander.getWorldPoint(pl.Vec2(1.5, 1));
+            lander.applyForce(force, point, true);
+            fuel -= 0.5;
+
+            let p = lander.getWorldPoint(pl.Vec2(1.5, 1));
+            emitParticle(p.x, p.y, 2 + Math.random()*2, (Math.random()-0.5), false);
+        }
+
+        // Box2Dエンジンを1フレーム進める
+        world.step(1 / 60);
+
+        // --- 勝敗判定 ---
+        let pos = lander.getPosition();
+        let vel = lander.getLinearVelocity();
+        let angle = lander.getAngle();
+
+        // 画面外への落下・飛散アウト
+        if (pos.x < -20 || pos.x > 20 || pos.y > 30 || pos.y < -10) {
+            setGameOver('lose');
+            return;
+        }
+
+        // 接触判定
+        let isTouching = false;
+        for (let ce = lander.getContactList(); ce; ce = ce.next) {
+            if (ce.contact.isTouching()) {
+                isTouching = true;
+                break;
+            }
+        }
+
+        if (isTouching) {
+            // パッドの中央に着地しているか
+            let onPad = (pos.x > -4.0 && pos.x < 4.0);
+            let isUpright = Math.abs(angle) < 0.3; // 傾きが少ないか
+            let isSlow = Math.abs(vel.x) < 2.0 && Math.abs(vel.y) < 2.0; // 激突していないか
+
+            if (onPad && isUpright && isSlow) {
+                // 完全に静止したらクリア
+                if (Math.abs(vel.x) < 0.1 && Math.abs(vel.y) < 0.1 && Math.abs(lander.getAngularVelocity()) < 0.1) {
+                    setGameOver('win');
+                }
+            } else {
+                setGameOver('lose'); // 墜落
+            }
+        }
+    }
+
+    function setGameOver(state) {
+        gameState = state;
+        restartBtn.style.display = 'inline-block';
+    }
+
+    // --- 描画処理 ---
+    function render() {
+        // キャンバスのリセット
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        // --- 物理座標系への変換 ---
+        // 1メートル = 20ピクセル。原点を画面中央の下部に設定し、Y軸を上向きに。
+        ctx.translate(canvas.width / 2, canvas.height * 0.75);
+        ctx.scale(20, -20); 
+
+        // 1. 地形の描画
+        ctx.beginPath();
+        ctx.moveTo(terrainPoints[0].x, terrainPoints[0].y);
+        for(let i=1; i<terrainPoints.length; i++) {
+            ctx.lineTo(terrainPoints[i].x, terrainPoints[i].y);
+        }
+        ctx.lineTo(20, -20);
+        ctx.lineTo(-20, -20);
+        ctx.closePath();
+        ctx.fillStyle = '#34495e';
+        ctx.fill();
+        ctx.strokeStyle = '#95a5a6';
+        ctx.lineWidth = 0.1;
+        ctx.stroke();
+
+        // 2. 着陸パッドの旗
+        ctx.strokeStyle = '#f1c40f';
+        ctx.lineWidth = 0.2;
+        ctx.beginPath();
+        ctx.moveTo(-5, -5); ctx.lineTo(-5, -2);
+        ctx.moveTo(5, -5); ctx.lineTo(5, -2);
+        ctx.stroke();
+
+        // 3. パーティクル（炎）の描画
+        for (let i = particles.length - 1; i >= 0; i--) {
+            let p = particles[i];
+            p.x += p.vx * (1/60);
+            p.y += p.vy * (1/60);
+            p.life -= 0.05;
+            if (p.life <= 0) {
+                particles.splice(i, 1);
+                continue;
+            }
+            ctx.fillStyle = `rgba(${p.color}, ${p.life})`;
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, 0.3 * p.life, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        // 4. 着陸船の描画
+        for (let fixture = lander.getFixtureList(); fixture; fixture = fixture.getNext()) {
+            let shape = fixture.getShape();
+            let vertices = shape.m_vertices;
+            if (!vertices) continue;
+
+            ctx.beginPath();
+            let p0 = lander.getWorldPoint(vertices[0]);
+            ctx.moveTo(p0.x, p0.y);
+            for (let i = 1; i < vertices.length; i++) {
+                let p = lander.getWorldPoint(vertices[i]);
+                ctx.lineTo(p.x, p.y);
+            }
+            ctx.closePath();
+            
+            // 密度によって色を変える（本体：紫、脚：グレー）
+            ctx.fillStyle = fixture.getDensity() > 1.0 ? '#9b59b6' : '#ecf0f1';
+            ctx.fill();
+            ctx.strokeStyle = '#2c3e50';
+            ctx.lineWidth = 0.05;
+            ctx.stroke();
+        }
+
+        // --- UIの描画 (スクリーン座標系に戻す) ---
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        
+        ctx.fillStyle = 'white';
+        ctx.font = '20px sans-serif';
+        ctx.fillText(`Fuel: ${Math.max(0, Math.floor(fuel))}`, 20, 35);
+
+        if (gameState === 'win') {
+            ctx.fillStyle = 'rgba(46, 204, 113, 0.2)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#2ecc71';
+            ctx.font = 'bold 48px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('LANDING SUCCESS!', canvas.width / 2, canvas.height / 2);
+        } else if (gameState === 'lose') {
+            ctx.fillStyle = 'rgba(231, 76, 60, 0.2)';
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.fillStyle = '#e74c3c';
+            ctx.font = 'bold 48px sans-serif';
+            ctx.textAlign = 'center';
+            ctx.fillText('CRASHED!', canvas.width / 2, canvas.height / 2);
+        }
+    }
+
+    // --- メインループ ---
+    function gameLoop() {
+        updatePhysics();
+        render();
+        animationId = requestAnimationFrame(gameLoop);
+    }
+
+    // ゲーム開始
+    initGame();
+</script>
+
+</body>
+</html>

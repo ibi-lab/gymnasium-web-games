@@ -1,0 +1,357 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BipedalWalker (Gymnasium Style)</title>
+    <script src="https://cdn.jsdelivr.net/npm/planck@1/dist/planck.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #f0f2f5; /* ページ全体の背景 */
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+        }
+        #game-container {
+            position: relative;
+            background-color: #fff;
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+            text-align: center;
+            padding: 5px;
+            border: 1px solid #ddd;
+        }
+        canvas {
+            background-color: #ffffff; /* ★Gym準拠: 背景を白に */
+            border-radius: 8px;
+            display: block;
+        }
+        .ui-overlay {
+            position: absolute;
+            bottom: 20px;
+            left: 20px;
+            text-align: left;
+            color: #333;
+            text-shadow: 1px 1px 0px rgba(255,255,255,0.8);
+            pointer-events: none;
+            font-size: 20px;
+            font-weight: bold;
+        }
+        .ui-overlay h3 { margin: 0 0 5px 0; }
+        .controls {
+            position: absolute;
+            top: 15px;
+            left: 20px;
+            background-color: rgba(255, 255, 255, 0.9);
+            padding: 10px 15px;
+            border-radius: 8px;
+            color: #333;
+            text-align: left;
+            font-size: 13px;
+            line-height: 1.6;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+            border: 1px solid #eee;
+        }
+        .controls table { border-collapse: collapse; width: 100%; margin-top: 5px; font-size: 12px;}
+        .controls th, .controls td { padding: 3px 5px; text-align: center; border: 1px solid #ccc; }
+        .controls th { background-color: #f4f4f4; }
+        button {
+            margin-top: 15px;
+            padding: 8px 16px;
+            font-size: 14px;
+            background-color: #3498db;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: background-color 0.2s;
+        }
+        button:hover { background-color: #2980b9; }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <canvas id="gameCanvas" width="900" height="500"></canvas>
+    <div class="controls">
+        <strong>操作方法 (QWOPスタイル)</strong><br>
+        <table>
+            <tr><th>部位</th><th>前へ / 伸ばす</th><th>後ろへ / 曲げる</th></tr>
+            <tr><td>左脚 股関節</td><td>[Q]</td><td>[A]</td></tr>
+            <tr><td>左脚 膝関節</td><td>[W]</td><td>[S]</td></tr>
+            <tr><td>右脚 股関節</td><td>[E]</td><td>[D]</td></tr>
+            <tr><td>右脚 膝関節</td><td>[R]</td><td>[F]</td></tr>
+        </table>
+        <button id="restartBtn" onclick="initGame()">リトライ (Spaceキー)</button>
+    </div>
+    <div class="ui-overlay">
+        <h3>Distance: <span id="scoreUI">0.0</span> m</h3>
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const scoreUI = document.getElementById('scoreUI');
+    const pl = planck;
+
+    let world;
+    let hull, leftThigh, leftCalf, rightThigh, rightCalf;
+    let jointHipLeft, jointKneeLeft, jointHipRight, jointKneeRight;
+    let terrainPoints = [];
+    let animationId;
+    let startX = 0;
+
+    // キーボード入力状態
+    const keys = { Q:false, A:false, W:false, S:false, E:false, D:false, R:false, F:false };
+    
+    window.addEventListener('keydown', (e) => {
+        let code = e.code.replace('Key', '');
+        if (keys.hasOwnProperty(code)) {
+            keys[code] = true;
+            e.preventDefault(); // QWOPキーでのスクロール等を防ぐ
+        }
+        if (e.code === 'Space') initGame();
+    });
+    window.addEventListener('keyup', (e) => {
+        let code = e.code.replace('Key', '');
+        if (keys.hasOwnProperty(code)) keys[code] = false;
+    });
+
+    // 衝突フィルタの定義 (脚同士がぶつからないようにする)
+    const CATEGORY_TERRAIN = 0x0001;
+    const CATEGORY_ROBOT = 0x0002;
+
+    function initGame() {
+        if (animationId) cancelAnimationFrame(animationId);
+
+        // 重力 (-10)
+        world = pl.World(pl.Vec2(0, -10));
+
+        // --- 地形の生成 ---
+        terrainPoints = [];
+        const numPoints = 300; // コースを長く
+        let x = -20; // スタート位置を少し右に
+        let y = 0;
+        for (let i = 0; i < numPoints; i++) {
+            terrainPoints.push(pl.Vec2(x, y));
+            x += 1.0;
+            // 最初の10mは平坦、その後は緩やかな起伏
+            if (x > 10) y += (Math.random() - 0.5) * 0.4;
+        }
+
+        const ground = world.createBody();
+        ground.createFixture(pl.Chain(terrainPoints), {
+            friction: 1.0, // グリップを強く
+            filterCategoryBits: CATEGORY_TERRAIN,
+            filterMaskBits: CATEGORY_ROBOT
+        });
+
+        // --- ロボットの生成 (BipedalWalker 寸法・物理パラメータ準拠) ---
+        const startPosY = 3.2; // 少し高い位置からスタート
+        startX = 0;
+
+        // 1. 胴体 (Hull) - ★Gym準拠: 黄色系の四角形
+        hull = world.createDynamicBody({ position: pl.Vec2(0, startPosY) });
+        hull.createFixture(pl.Polygon([
+            pl.Vec2(-0.8, -0.25), pl.Vec2(0.8, -0.25),
+            pl.Vec2(0.8, 0.25), pl.Vec2(-0.8, 0.25)
+        ]), { density: 5.0, friction: 0.1, filterCategoryBits: CATEGORY_ROBOT, filterMaskBits: CATEGORY_TERRAIN });
+
+        // 脚の作成関数
+        function createLeg(offsetX, isFront) {
+            // 太もも (Thigh)
+            let thigh = world.createDynamicBody({ position: pl.Vec2(offsetX, startPosY - 0.6) });
+            thigh.createFixture(pl.Box(0.2, 0.6), { density: 1.0, friction: 0.5, filterCategoryBits: CATEGORY_ROBOT, filterMaskBits: CATEGORY_TERRAIN });
+
+            // ふくらはぎ (Calf)
+            let calf = world.createDynamicBody({ position: pl.Vec2(offsetX, startPosY - 1.8) });
+            calf.createFixture(pl.Box(0.16, 0.6), { density: 1.0, friction: 0.8, filterCategoryBits: CATEGORY_ROBOT, filterMaskBits: CATEGORY_TERRAIN });
+
+            // 股関節 (Hip Joint)
+            let hipJoint = world.createJoint(pl.RevoluteJoint({
+                enableMotor: true,
+                maxMotorTorque: 140.0, // トルクをGymに近づける
+                enableLimit: true,
+                lowerAngle: -0.8,  
+                upperAngle: 1.1    
+            }, hull, thigh, pl.Vec2(offsetX, startPosY)));
+
+            // 膝関節 (Knee Joint)
+            let kneeJoint = world.createJoint(pl.RevoluteJoint({
+                enableMotor: true,
+                maxMotorTorque: 100.0,
+                enableLimit: true,
+                lowerAngle: -1.6, 
+                upperAngle: 0.05   
+            }, thigh, calf, pl.Vec2(offsetX, startPosY - 1.2)));
+
+            return { thigh, calf, hipJoint, kneeJoint };
+        }
+
+        // Gymでは奥の脚(Right)を先に描画し、手前の脚(Left)を後に描画する
+        let rightLeg = createLeg(0.0, false); // 奥の脚
+        rightThigh = rightLeg.thigh; rightCalf = rightLeg.calf;
+        jointHipRight = rightLeg.hipJoint; jointKneeRight = rightLeg.kneeJoint;
+
+        let leftLeg = createLeg(0.0, true); // 手前の脚
+        leftThigh = leftLeg.thigh; leftCalf = leftLeg.calf;
+        jointHipLeft = leftLeg.hipJoint; jointKneeLeft = leftLeg.kneeJoint;
+
+        gameLoop();
+    }
+
+    function updatePhysics() {
+        const motorSpeedHip = 4.0;
+        const motorSpeedKnee = 5.0;
+
+        // 手前の脚 (Left)
+        if (keys.Q) jointHipLeft.setMotorSpeed(motorSpeedHip);       // 前へ
+        else if (keys.A) jointHipLeft.setMotorSpeed(-motorSpeedHip); // 後ろへ
+        else jointHipLeft.setMotorSpeed(0);
+
+        if (keys.W) jointKneeLeft.setMotorSpeed(motorSpeedKnee);     // 伸ばす
+        else if (keys.S) jointKneeLeft.setMotorSpeed(-motorSpeedKnee); // 曲げる
+        else jointKneeLeft.setMotorSpeed(0);
+
+        // 奥の脚 (Right)
+        if (keys.E) jointHipRight.setMotorSpeed(motorSpeedHip);       // 前へ
+        else if (keys.D) jointHipRight.setMotorSpeed(-motorSpeedHip); // 後ろへ
+        else jointHipRight.setMotorSpeed(0);
+
+        if (keys.R) jointKneeRight.setMotorSpeed(motorSpeedKnee);     // 伸ばす
+        else if (keys.F) jointKneeRight.setMotorSpeed(-motorSpeedKnee); // 曲げる
+        else jointKneeRight.setMotorSpeed(0);
+
+        // スコア（移動距離）の更新
+        let currentX = hull.getPosition().x;
+        let score = Math.max(0, currentX - startX);
+        scoreUI.innerText = score.toFixed(1);
+
+        world.step(1 / 60);
+    }
+
+    // ★Gym準拠: パーツごとの描画処理
+    function drawRobotPart(body, color) {
+        let pos = body.getPosition();
+        let angle = body.getAngle();
+        ctx.save();
+        ctx.translate(pos.x, pos.y);
+        ctx.rotate(angle);
+        
+        ctx.fillStyle = color;
+        ctx.beginPath();
+        for (let fixture = body.getFixtureList(); fixture; fixture = fixture.getNext()) {
+            let shape = fixture.getShape();
+            let vertices = shape.m_vertices;
+            if (vertices) {
+                ctx.moveTo(vertices[0].x, vertices[0].y);
+                for (let i = 1; i < vertices.length; i++) {
+                    ctx.lineTo(vertices[i].x, vertices[i].y);
+                }
+            }
+        }
+        ctx.closePath();
+        ctx.fill();
+        // 薄い黒の輪郭線
+        ctx.strokeStyle = 'rgba(0,0,0,0.5)';
+        ctx.lineWidth = 0.02;
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    // ★Gym準拠: 関節部分の黒丸を描画
+    function drawJointMarker(joint) {
+        let pos = joint.getAnchorA();
+        ctx.fillStyle = '#000000';
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, 0.08, 0, Math.PI * 2);
+        ctx.fill();
+    }
+
+    function render() {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+        let pos = hull.getPosition();
+
+        // --- ★Gym準拠: カメラワーク (1m = 30pxに縮小して全体を見やすく) ---
+        const scale = 30;
+        ctx.translate(canvas.width / 2, canvas.height * 0.75); 
+        ctx.scale(scale, -scale); // Y軸反転
+        ctx.translate(-pos.x, -pos.y + 0.5); // カメラを少し下げる
+
+        // --- ★Gym準拠: 背景のグリッド線を描画 ---
+        ctx.save();
+        ctx.lineWidth = 0.01;
+        ctx.strokeStyle = 'rgba(0, 0, 0, 0.1)';
+        // 垂直線 (1m間隔)
+        for (let x = Math.floor(pos.x - 20); x < pos.x + 20; x++) {
+            ctx.beginPath(); ctx.moveTo(x, -10); ctx.lineTo(x, 20); ctx.stroke();
+        }
+        // 水平線 (1m間隔)
+        for (let y = -5; y < 15; y++) {
+            ctx.beginPath(); ctx.moveTo(pos.x - 20, y); ctx.lineTo(pos.x + 20, y); ctx.stroke();
+        }
+        ctx.restore();
+
+        // --- ★Gym準拠: 地形の描画 (灰色のポリゴン + 緑の表面) ---
+        ctx.beginPath();
+        ctx.moveTo(terrainPoints[0].x, terrainPoints[0].y);
+        for (let i = 1; i < terrainPoints.length; i++) {
+            ctx.lineTo(terrainPoints[i].x, terrainPoints[i].y);
+        }
+        ctx.lineTo(terrainPoints[terrainPoints.length-1].x, -20);
+        ctx.lineTo(terrainPoints[0].x, -20);
+        ctx.fillStyle = '#7f7f7f'; // 地面の内部の色 (灰色)
+        ctx.fill();
+        
+        // 地面の表面のライン (緑)
+        ctx.beginPath();
+        ctx.moveTo(terrainPoints[0].x, terrainPoints[0].y);
+        for (let i = 1; i < terrainPoints.length; i++) {
+            ctx.lineTo(terrainPoints[i].x, terrainPoints[i].y);
+        }
+        ctx.strokeStyle = '#228B22'; // 表面の色 (フォレストグリーン)
+        ctx.lineWidth = 0.1;
+        ctx.stroke();
+
+        // --- ★Gym準拠: ロボットの描画 (色とレイヤー順序) ---
+        
+        // 1. 奥の脚 (Right) - 濃い赤色
+        const colorLegBack = '#800000'; // Dark Red
+        drawRobotPart(rightThigh, colorLegBack);
+        drawRobotPart(rightCalf, colorLegBack);
+        
+        // 2. 胴体 (Hull) - 黄色
+        drawRobotPart(hull, '#ffff00'); // Yellow
+        
+        // 3. 手前の脚 (Left) - 明るい赤色
+        const colorLegFront = '#ff0000'; // Red
+        drawRobotPart(leftThigh, colorLegFront);
+        drawRobotPart(leftCalf, colorLegFront);
+
+        // 4. 関節のマーカー
+        drawJointMarker(jointHipRight);
+        drawJointMarker(jointKneeRight);
+        drawJointMarker(jointHipLeft);
+        drawJointMarker(jointKneeLeft);
+    }
+
+    function gameLoop() {
+        updatePhysics();
+        render();
+        animationId = requestAnimationFrame(gameLoop);
+    }
+
+    // ゲーム開始
+    initGame();
+</script>
+
+</body>
+</html>

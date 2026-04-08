@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CarRacing-v3 (Gymnasium Style)</title>
+    <script src="https://cdn.jsdelivr.net/npm/planck@1/dist/planck.min.js"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background-color: #1a1a1a;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+            margin: 0;
+            overflow: hidden;
+        }
+        #game-container {
+            position: relative;
+            background-color: #000;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+            text-align: center;
+            border: 2px solid #333;
+        }
+        canvas {
+            display: block;
+        }
+        .controls {
+            position: absolute;
+            top: 10px;
+            left: 10px;
+            background-color: rgba(0, 0, 0, 0.7);
+            color: #fff;
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 13px;
+            text-align: left;
+            pointer-events: none;
+            line-height: 1.5;
+        }
+        #intro-msg {
+            position: absolute;
+            top: 40%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: white;
+            font-size: 48px;
+            font-weight: bold;
+            text-shadow: 2px 2px 5px rgba(0,0,0,0.8);
+            pointer-events: none;
+            opacity: 0;
+            transition: opacity 0.5s;
+        }
+    </style>
+</head>
+<body>
+
+<div id="game-container">
+    <canvas id="gameCanvas" width="800" height="600"></canvas>
+    <div id="intro-msg">GO!</div>
+    <div class="controls">
+        <strong>[↑]</strong> アクセル<br>
+        <strong>[↓]</strong> ブレーキ / バック<br>
+        <strong>[←] [→]</strong> ステアリング<br>
+        <strong>[Space]</strong> コース再生成 (リトライ)
+    </div>
+</div>
+
+<script>
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    const introMsg = document.getElementById('intro-msg');
+    const pl = planck;
+
+    let world;
+    let car;
+    let ground;
+    let pathPoints = [];
+    let outerBoundary = [];
+    let innerBoundary = [];
+    let roadSegments = [];
+    let skidMarks = [];
+
+    // ステートとカメラ管理
+    let score = 0;
+    let totalTiles = 0;
+    let currentSpeed = 0;
+    let steeringAngle = 0; 
+    let throttle = 0; 
+    let brake = 0; 
+    let animationId;
+    
+    // ズームイン演出用のタイマーとパラメータ
+    let introTimer = 0; 
+    let courseCenterX = 0;
+    let courseCenterY = 0;
+    let courseIntroScale = 1.0;
+
+    const TRACK_WIDTH = 12;
+    const DASHBOARD_HEIGHT = 100;
+    const INTRO_WAIT_FRAMES = 60;  // コース全体を表示して待機するフレーム数
+    const INTRO_ZOOM_FRAMES = 120; // ズームインにかけるフレーム数
+
+    // キーボード入力
+    const keys = { ArrowUp: false, ArrowDown: false, ArrowLeft: false, ArrowRight: false };
+    window.addEventListener('keydown', (e) => {
+        if (keys.hasOwnProperty(e.code)) { keys[e.code] = true; e.preventDefault(); }
+        if (e.code === 'Space') initGame();
+    });
+    window.addEventListener('keyup', (e) => {
+        if (keys.hasOwnProperty(e.code)) keys[e.code] = false;
+    });
+
+    // Catmull-Rom スプライン補間
+    function catmullRom(p0, p1, p2, p3, t) {
+        const t2 = t * t;
+        const t3 = t2 * t;
+        return pl.Vec2(
+            0.5 * ((2 * p1.x) + (-p0.x + p2.x) * t + (2 * p0.x - 5 * p1.x + 4 * p2.x - p3.x) * t2 + (-p0.x + 3 * p1.x - 3 * p2.x + p3.x) * t3),
+            0.5 * ((2 * p1.y) + (-p0.y + p2.y) * t + (2 * p0.y - 5 * p1.y + 4 * p2.y - p3.y) * t2 + (-p0.y + 3 * p1.y - 3 * p2.y + p3.y) * t3)
+        );
+    }
+
+    function initGame() {
+        if (animationId) cancelAnimationFrame(animationId);
+
+        world = pl.World(pl.Vec2(0, 0));
+        pathPoints = []; outerBoundary = []; innerBoundary = [];
+        roadSegments = []; skidMarks = [];
+        score = 0; introTimer = 0;
+        introMsg.style.opacity = 0;
+
+        // --- 1. コースのプロシージャル生成 ---
+        const numCheckpoints = 15;
+        let checkpoints = [];
+        const baseRadius = 80;
+
+        for(let i=0; i<numCheckpoints; i++) {
+            let angle = (i / numCheckpoints) * Math.PI * 2;
+            let r = baseRadius + (Math.random() - 0.5) * 60;
+            checkpoints.push(pl.Vec2(Math.cos(angle)*r, Math.sin(angle)*r));
+        }
+
+        // 一旦、回転なしでスプラインパス(生データ)を生成
+        let rawPathPoints = [];
+        const segmentsPerCheckpoint = 12;
+        for(let i=0; i<numCheckpoints; i++) {
+            let cp0 = checkpoints[(i - 1 + numCheckpoints) % numCheckpoints];
+            let cp1 = checkpoints[i];
+            let cp2 = checkpoints[(i + 1) % numCheckpoints];
+            let cp3 = checkpoints[(i + 2) % numCheckpoints];
+            for(let j=0; j<segmentsPerCheckpoint; j++) {
+                let t = j / segmentsPerCheckpoint;
+                rawPathPoints.push(catmullRom(cp0, cp1, cp2, cp3, t));
+            }
+        }
+
+        // ★ アップデート: スプライン曲線の最初の1歩目が完全に上（+Y方向）を向くように全体を回転
+        let p0 = rawPathPoints[0];
+        let p1 = rawPathPoints[1];
+        let initialPathAngle = Math.atan2(p1.y - p0.y, p1.x - p0.x);
+        let rotationAngle = (Math.PI / 2) - initialPathAngle; // 上向き(PI/2)にするための差分
+
+        for (let i = 0; i < rawPathPoints.length; i++) {
+            let cx = rawPathPoints[i].x;
+            let cy = rawPathPoints[i].y;
+            pathPoints.push(pl.Vec2(
+                cx * Math.cos(rotationAngle) - cy * Math.sin(rotationAngle),
+                cx * Math.sin(rotationAngle) + cy * Math.cos(rotationAngle)
+            ));
+        }
+
+        // 法線から内周と外周を生成、同時にバウンディングボックス(コースの広さ)を計算
+        let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+
+        for(let i=0; i<pathPoints.length; i++) {
+            let p_curr = pathPoints[i];
+            let p_next = pathPoints[(i + 1) % pathPoints.length];
+            let dx = p_next.x - p_curr.x;
+            let dy = p_next.y - p_curr.y;
+            let len = Math.sqrt(dx*dx + dy*dy);
+            let nx = -dy / len;
+            let ny = dx / len;
+
+            let outP = pl.Vec2(p_curr.x + nx * TRACK_WIDTH/2, p_curr.y + ny * TRACK_WIDTH/2);
+            let innP = pl.Vec2(p_curr.x - nx * TRACK_WIDTH/2, p_curr.y - ny * TRACK_WIDTH/2);
+            outerBoundary.push(outP);
+            innerBoundary.push(innP);
+
+            if(outP.x < minX) minX = outP.x; if(outP.x > maxX) maxX = outP.x;
+            if(outP.y < minY) minY = outP.y; if(outP.y > maxY) maxY = outP.y;
+        }
+
+        // ズームイン演出のためのコース中心と初期スケールの計算
+        courseCenterX = (minX + maxX) / 2;
+        courseCenterY = (minY + maxY) / 2;
+        let courseWidth = maxX - minX;
+        let courseHeight = maxY - minY;
+        let playAreaHeight = canvas.height - DASHBOARD_HEIGHT;
+        // コース全体が画面に収まるスケールを計算 (余白を持たせるため0.85倍)
+        courseIntroScale = Math.min(canvas.width / courseWidth, playAreaHeight / courseHeight) * 0.85;
+
+        // 物理ボディ(道路タイル)の作成
+        ground = world.createBody();
+        totalTiles = pathPoints.length;
+
+        for (let i = 0; i < pathPoints.length; i++) {
+            const next_i = (i + 1) % pathPoints.length;
+            const vertices = [
+                outerBoundary[i], innerBoundary[i], innerBoundary[next_i], outerBoundary[next_i]
+            ];
+            let fixture = ground.createFixture(pl.Polygon(vertices), {
+                isSensor: true,
+                userData: { isRoad: true, id: i, visited: false }
+            });
+            roadSegments.push({ vertices: vertices, fixture: fixture, visited: false });
+        }
+
+        // --- 2. 車(Car)の生成 ---
+        let startP1 = pathPoints[0];
+        let startP2 = pathPoints[1];
+        // 最初のセグメントから物理的な角度を計算
+        let startAngle = Math.atan2(startP2.y - startP1.y, startP2.x - startP1.x) - Math.PI/2;
+
+        car = world.createDynamicBody({
+            position: startP1,
+            angle: startAngle, // 補正済みのため、ほぼ確実に 0 になる
+            linearDamping: 1.0,
+            angularDamping: 2.5
+        });
+
+        car.createFixture(pl.Box(0.8, 1.6), { density: 1.0, friction: 0.3, restitution: 0.1 });
+
+        gameLoop();
+    }
+
+    function updatePhysics() {
+        // ズームイン中は物理演算(車の移動)をストップし、タイマーを進める
+        if (introTimer < INTRO_WAIT_FRAMES + INTRO_ZOOM_FRAMES) {
+            introTimer++;
+            car.setLinearVelocity(pl.Vec2(0,0));
+            car.setAngularVelocity(0);
+            
+            if (introTimer === INTRO_WAIT_FRAMES + INTRO_ZOOM_FRAMES) {
+                introMsg.style.opacity = 1;
+                setTimeout(() => introMsg.style.opacity = 0, 1000);
+            }
+            return; // プレイヤーの操作を無効化
+        }
+
+        const mass = car.getMass();
+        const carCenter = car.getWorldCenter();
+        const vel = car.getLinearVelocity();
+        const angularVel = car.getAngularVelocity();
+
+        const forwardVec = car.getWorldVector(pl.Vec2(0, 1));
+        const rightVec = car.getWorldVector(pl.Vec2(1, 0));
+
+        let forwardSpeed = pl.Vec2.dot(vel, forwardVec);
+        let lateralSpeed = pl.Vec2.dot(vel, rightVec);
+        currentSpeed = forwardSpeed * 3.6;
+
+        let isOnRoad = false;
+        
+        const aabb = pl.AABB(pl.Vec2(carCenter.x - 2, carCenter.y - 2), pl.Vec2(carCenter.x + 2, carCenter.y + 2));
+        world.queryAABB(aabb, (fixture) => {
+            if (fixture.getBody() === ground) {
+                if (fixture.getShape().testPoint(ground.getTransform(), carCenter)) {
+                    let ud = fixture.getUserData();
+                    if (ud && ud.isRoad) {
+                        isOnRoad = true;
+                        if (!ud.visited) {
+                            ud.visited = true;
+                            roadSegments[ud.id].visited = true;
+                            score += 1000 / totalTiles;
+                        }
+                    }
+                }
+            }
+            return true;
+        });
+
+        let gripFactor = isOnRoad ? 0.95 : 0.2;
+        car.setLinearDamping(isOnRoad ? 0.8 : 5.0);
+
+        if (Math.abs(lateralSpeed) > 1.5 || (!isOnRoad && Math.abs(forwardSpeed) > 2.0)) {
+            let rearLeft = car.getWorldPoint(pl.Vec2(-0.8, -1.2));
+            let rearRight = car.getWorldPoint(pl.Vec2(0.8, -1.2));
+            skidMarks.push({l: rearLeft, r: rearRight, life: 1.0});
+        }
+        for(let i = 0; i < skidMarks.length; i++) skidMarks[i].life -= 0.002;
+        skidMarks = skidMarks.filter(s => s.life > 0);
+
+        throttle = 0; brake = 0; steeringAngle = 0;
+        const maxForce = mass * (isOnRoad ? 80 : 30);
+        
+        if (keys.ArrowUp) {
+            car.applyForceToCenter(pl.Vec2(forwardVec.x * maxForce, forwardVec.y * maxForce));
+            throttle = 1.0;
+        } else if (keys.ArrowDown) {
+            car.applyForceToCenter(pl.Vec2(forwardVec.x * -maxForce * 0.8, forwardVec.y * -maxForce * 0.8));
+            brake = 1.0;
+        }
+
+        if (Math.abs(forwardSpeed) > 1.0) {
+            let turnSpeed = 3.5;
+            let dir = (forwardSpeed > 0) ? 1 : -1;
+            if (keys.ArrowLeft) { car.setAngularVelocity(turnSpeed * dir); steeringAngle = -1.0; }
+            else if (keys.ArrowRight) { car.setAngularVelocity(-turnSpeed * dir); steeringAngle = 1.0; }
+            else { car.setAngularVelocity(angularVel * 0.8); }
+        }
+
+        let lateralImpulse = mass * -lateralSpeed * gripFactor;
+        car.applyLinearImpulse(pl.Vec2(rightVec.x * lateralImpulse, rightVec.y * lateralImpulse), carCenter);
+
+        score -= 0.1; // プレイ中のみタイムペナルティ
+
+        world.step(1 / 60);
+    }
+
+    function render() {
+        ctx.setTransform(1, 0, 0, 1, 0, 0);
+        ctx.fillStyle = '#4CAF50';
+        ctx.fillRect(0, 0, canvas.width, canvas.height - DASHBOARD_HEIGHT);
+
+        let carPos = car.getPosition();
+        let carAngle = car.getAngle();
+
+        // カメラの補間 (ズームインアニメーション)
+        let camScale, camX, camY, camAngle, camOffsetY;
+        let playScale = 6;
+        
+        // ★ アップデート: 余計な90度回転の補正(+ Math.PI/2)を削除し、純粋に車の角度の逆回転を適用
+        let targetCamAngle = -carAngle; 
+
+        if (introTimer < INTRO_WAIT_FRAMES + INTRO_ZOOM_FRAMES) {
+            let t = Math.max(0, (introTimer - INTRO_WAIT_FRAMES) / INTRO_ZOOM_FRAMES);
+            // イージング関数 (Smoothstep)
+            t = t * t * (3 - 2 * t);
+
+            camScale = courseIntroScale * (1 - t) + playScale * t;
+            camX = courseCenterX * (1 - t) + carPos.x * t;
+            camY = courseCenterY * (1 - t) + carPos.y * t;
+            camAngle = 0 * (1 - t) + targetCamAngle * t;
+            
+            let offsetY_intro = (canvas.height - DASHBOARD_HEIGHT) * 0.5;
+            let offsetY_play = (canvas.height - DASHBOARD_HEIGHT) * 0.7;
+            camOffsetY = offsetY_intro * (1 - t) + offsetY_play * t;
+        } else {
+            camScale = playScale;
+            camX = carPos.x;
+            camY = carPos.y;
+            camAngle = targetCamAngle;
+            camOffsetY = (canvas.height - DASHBOARD_HEIGHT) * 0.7;
+        }
+
+        ctx.save();
+        ctx.translate(canvas.width / 2, camOffsetY); 
+        ctx.scale(camScale, -camScale);
+        ctx.rotate(camAngle);
+        ctx.translate(-camX, -camY);
+
+        // --- スキッドマーク ---
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.3)';
+        for(let i=0; i<skidMarks.length; i++) {
+            let s = skidMarks[i];
+            ctx.globalAlpha = s.life;
+            ctx.beginPath();
+            ctx.arc(s.l.x, s.l.y, 0.2, 0, Math.PI*2);
+            ctx.arc(s.r.x, s.r.y, 0.2, 0, Math.PI*2);
+            ctx.fill();
+        }
+        ctx.globalAlpha = 1.0;
+
+        // --- コースの描画 ---
+        ctx.beginPath();
+        ctx.moveTo(outerBoundary[0].x, outerBoundary[0].y);
+        for(let i=1; i<outerBoundary.length; i++) ctx.lineTo(outerBoundary[i].x, outerBoundary[i].y);
+        ctx.closePath();
+        ctx.moveTo(innerBoundary[0].x, innerBoundary[0].y);
+        for(let i=innerBoundary.length-1; i>=0; i--) ctx.lineTo(innerBoundary[i].x, innerBoundary[i].y);
+        ctx.closePath();
+        ctx.fillStyle = '#666666';
+        ctx.fill();
+
+        ctx.lineWidth = 0.8;
+        const dashLen = 2.0;
+        ctx.setLineDash([dashLen, dashLen]);
+        
+        ctx.strokeStyle = '#ffffff';
+        ctx.beginPath();
+        for(let i=0; i<outerBoundary.length; i++) { ctx[i===0?'moveTo':'lineTo'](outerBoundary[i].x, outerBoundary[i].y); }
+        ctx.stroke();
+        ctx.beginPath();
+        for(let i=0; i<innerBoundary.length; i++) { ctx[i===0?'moveTo':'lineTo'](innerBoundary[i].x, innerBoundary[i].y); }
+        ctx.stroke();
+
+        ctx.lineDashOffset = dashLen;
+        ctx.strokeStyle = '#ff0000';
+        ctx.beginPath();
+        for(let i=0; i<outerBoundary.length; i++) { ctx[i===0?'moveTo':'lineTo'](outerBoundary[i].x, outerBoundary[i].y); }
+        ctx.stroke();
+        ctx.beginPath();
+        for(let i=0; i<innerBoundary.length; i++) { ctx[i===0?'moveTo':'lineTo'](innerBoundary[i].x, innerBoundary[i].y); }
+        ctx.stroke();
+        ctx.setLineDash([]); ctx.lineDashOffset = 0;
+
+        // --- 車の描画 ---
+        ctx.save();
+        ctx.translate(carPos.x, carPos.y);
+        ctx.rotate(carAngle);
+        
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(-1.0, 0.8, 0.4, 0.8); ctx.fillRect(0.6, 0.8, 0.4, 0.8);
+        ctx.fillRect(-1.0, -1.4, 0.4, 0.8); ctx.fillRect(0.6, -1.4, 0.4, 0.8);
+
+        ctx.fillStyle = '#cc0000';
+        ctx.fillRect(-0.8, -1.6, 1.6, 3.2);
+
+        ctx.fillStyle = '#66ccff';
+        ctx.fillRect(-0.6, -0.4, 1.2, 0.8);
+        ctx.restore(); 
+        ctx.restore(); 
+
+        // --- ダッシュボード (計器UI) ---
+        ctx.fillStyle = '#000000';
+        ctx.fillRect(0, canvas.height - DASHBOARD_HEIGHT, canvas.width, DASHBOARD_HEIGHT);
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '24px monospace';
+        ctx.textAlign = 'left';
+        ctx.fillText(`SCORE: ${Math.max(0, Math.floor(score)).toString().padStart(4, '0')}`, 20, canvas.height - 40);
+
+        ctx.font = '16px monospace';
+        ctx.fillText(`SPEED: ${Math.abs(Math.floor(currentSpeed))} km/h`, 250, canvas.height - 40);
+
+        function drawGauge(x, y, width, value, color, label) {
+            ctx.fillStyle = '#333';
+            ctx.fillRect(x, y, width, 15);
+            ctx.fillStyle = color;
+            if (label === 'STEER') {
+                ctx.fillRect(x + width/2, y, (width/2) * value, 15);
+            } else {
+                ctx.fillRect(x, y, width * value, 15);
+            }
+            ctx.fillStyle = '#fff';
+            ctx.font = '12px monospace';
+            ctx.fillText(label, x, y - 5);
+        }
+
+        drawGauge(450, canvas.height - 60, 100, steeringAngle, '#3498db', 'STEER');
+        drawGauge(580, canvas.height - 60, 80, throttle, '#2ecc71', 'GAS');
+        drawGauge(690, canvas.height - 60, 80, brake, '#e74c3c', 'BRAKE');
+    }
+
+    function gameLoop() {
+        updatePhysics();
+        render();
+        animationId = requestAnimationFrame(gameLoop);
+    }
+
+    initGame();
+</script>
+
+</body>
+</html>
